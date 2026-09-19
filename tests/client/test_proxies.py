@@ -1,3 +1,5 @@
+import inspect
+
 import httpcore
 import pytest
 
@@ -140,6 +142,178 @@ def test_sync_proxy_close():
 def test_unsupported_proxy_scheme():
     with pytest.raises(ValueError):
         httpx.Client(proxies="ftp://127.0.0.1")
+
+
+class HTTPProxyWithHTTPVersions:
+    """
+    A stand-in for `httpcore.HTTPProxy` on versions of `httpcore` that
+    accept the `http1`/`http2` arguments.
+    """
+
+    def __init__(
+        self,
+        proxy_url,
+        proxy_headers=None,
+        ssl_context=None,
+        max_connections=None,
+        max_keepalive_connections=None,
+        keepalive_expiry=None,
+        http1=True,
+        http2=False,
+    ):
+        self.proxy_url = proxy_url
+        self.proxy_headers = proxy_headers
+        self.http1 = http1
+        self.http2 = http2
+
+
+class HTTPProxyWithoutHTTPVersions:
+    """
+    A stand-in for `httpcore.HTTPProxy` on versions of `httpcore` from
+    before the `http1`/`http2` arguments were introduced.
+    """
+
+    def __init__(
+        self,
+        proxy_url,
+        proxy_headers=None,
+        ssl_context=None,
+        max_connections=None,
+        max_keepalive_connections=None,
+        keepalive_expiry=None,
+    ):
+        self.proxy_url = proxy_url
+        self.proxy_headers = proxy_headers
+
+
+class HTTPProxyRaisingTypeError:
+    """
+    A stand-in for `httpcore.HTTPProxy` that raises a genuine `TypeError`
+    from within the constructor, unrelated to the signature.
+    """
+
+    def __init__(
+        self,
+        proxy_url,
+        proxy_headers=None,
+        ssl_context=None,
+        max_connections=None,
+        max_keepalive_connections=None,
+        keepalive_expiry=None,
+        http1=True,
+        http2=False,
+    ):
+        raise TypeError("A genuine error within the constructor.")
+
+
+@pytest.mark.parametrize(
+    ["http1", "http2"],
+    [(True, False), (True, True)],
+)
+def test_tunnel_proxy_forwards_http_version_flags(monkeypatch, http1, http2):
+    """
+    The `http1`/`http2` arguments should be passed on to the `httpcore`
+    proxy pool, so that HTTP/2 may also be used for tunnelled requests.
+    """
+    monkeypatch.setattr(httpcore, "HTTPProxy", HTTPProxyWithHTTPVersions)
+
+    transport = httpx.HTTPTransport(
+        http1=http1, http2=http2, proxy=httpx.Proxy("http://127.0.0.1:8080")
+    )
+
+    pool = transport._pool
+    assert isinstance(pool, HTTPProxyWithHTTPVersions)
+    assert pool.http1 is http1
+    assert pool.http2 is http2
+
+
+@pytest.mark.parametrize(
+    ["http1", "http2"],
+    [(True, False), (True, True)],
+)
+def test_tunnel_proxy_omits_http_version_flags_on_older_httpcore(
+    monkeypatch, http1, http2
+):
+    """
+    Versions of `httpcore` that predate the `http1`/`http2` arguments on
+    `httpcore.HTTPProxy` should be constructed without them.
+    """
+    monkeypatch.setattr(httpcore, "HTTPProxy", HTTPProxyWithoutHTTPVersions)
+
+    transport = httpx.HTTPTransport(
+        http1=http1, http2=http2, proxy=httpx.Proxy("http://127.0.0.1:8080")
+    )
+
+    assert isinstance(transport._pool, HTTPProxyWithoutHTTPVersions)
+
+
+def test_tunnel_proxy_does_not_swallow_constructor_type_errors(monkeypatch):
+    """
+    A `TypeError` raised from within the `httpcore.HTTPProxy` constructor
+    itself must propagate, rather than being treated as a signature
+    incompatibility and retried.
+    """
+    monkeypatch.setattr(httpcore, "HTTPProxy", HTTPProxyRaisingTypeError)
+
+    with pytest.raises(TypeError, match="genuine error"):
+        httpx.HTTPTransport(http2=True, proxy=httpx.Proxy("http://127.0.0.1:8080"))
+
+
+def test_tunnel_proxy_forwards_proxy_headers(monkeypatch):
+    """
+    Proxy headers, such as `Proxy-Authorization`, should be passed on to
+    the `httpcore` proxy pool.
+    """
+    monkeypatch.setattr(httpcore, "HTTPProxy", HTTPProxyWithHTTPVersions)
+
+    proxy = httpx.Proxy("http://username:password@127.0.0.1:8080")
+    transport = httpx.HTTPTransport(http2=True, proxy=proxy)
+
+    pool = transport._pool
+    assert isinstance(pool, HTTPProxyWithHTTPVersions)
+    assert pool.proxy_headers == [
+        (b"Proxy-Authorization", b"Basic dXNlcm5hbWU6cGFzc3dvcmQ=")
+    ]
+
+
+@pytest.mark.parametrize(
+    ["http1", "http2"],
+    [(True, False), (True, True)],
+)
+def test_client_tunnel_proxy_http_version_flags(monkeypatch, http1, http2):
+    """
+    The client-level `http1`/`http2` arguments should reach the proxy pool
+    used for tunnelled requests.
+    """
+    monkeypatch.setattr(httpcore, "HTTPProxy", HTTPProxyWithHTTPVersions)
+
+    client = httpx.Client(
+        proxies={"all://": "http://127.0.0.1:8080"}, http1=http1, http2=http2
+    )
+    transport = client._transport_for_url(httpx.URL("https://example.com"))
+
+    pool = transport._pool
+    assert isinstance(pool, HTTPProxyWithHTTPVersions)
+    assert pool.http1 is http1
+    assert pool.http2 is http2
+
+
+def test_tunnel_proxy_http_version_flags_against_installed_httpcore():
+    """
+    With the installed `httpcore`, the `http2` flag should reach the proxy
+    pool whenever the pool's signature supports it.
+    """
+    transport = httpx.HTTPTransport(
+        http2=True, proxy=httpx.Proxy("http://127.0.0.1:8080")
+    )
+
+    pool = transport._pool
+    assert isinstance(pool, httpcore.HTTPProxy)
+
+    parameters = inspect.signature(httpcore.HTTPProxy.__init__).parameters
+    if {"http1", "http2"} <= set(parameters):
+        assert pool._http1 is True
+        assert pool._http2 is True
 
 
 @pytest.mark.parametrize(

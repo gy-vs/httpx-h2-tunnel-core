@@ -24,6 +24,7 @@ transport = httpx.HTTPTransport(uds="socket.uds")
 client = httpx.Client(transport=transport)
 """
 import contextlib
+import inspect
 import typing
 from types import TracebackType
 
@@ -95,6 +96,25 @@ HTTPCORE_EXC_MAP = {
 }
 
 
+def _proxy_http_version_kwargs(
+    http1: bool, http2: bool
+) -> typing.Dict[str, typing.Any]:
+    """
+    The `http1` and `http2` arguments were only added to `httpcore.HTTPProxy`
+    partway through the `httpcore` 0.14.x series, so we need to accommodate
+    earlier versions that do not accept them.
+
+    We determine support by inspecting the signature up-front, rather than
+    attempting the call and catching `TypeError`, so that a genuine
+    `TypeError` raised from within the constructor itself is never mistaken
+    for an unsupported-signature case and silently swallowed.
+    """
+    parameters = inspect.signature(httpcore.HTTPProxy.__init__).parameters
+    if "http1" in parameters and "http2" in parameters:
+        return {"http1": http1, "http2": http2}
+    return {}
+
+
 class ResponseStream(SyncByteStream):
     def __init__(self, httpcore_stream: typing.Iterable[bytes]):
         self._httpcore_stream = httpcore_stream
@@ -150,6 +170,7 @@ class HTTPTransport(BaseTransport):
                 max_connections=limits.max_connections,
                 max_keepalive_connections=limits.max_keepalive_connections,
                 keepalive_expiry=limits.keepalive_expiry,
+                **_proxy_http_version_kwargs(http1=http1, http2=http2),
             )
 
     def __enter__(self: T) -> T:  # Use generics for subclass support.

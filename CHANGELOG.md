@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Fixed
+
+* The `http1`/`http2` arguments are now passed through to the proxy connection pool in `HTTPTransport`, so that `httpx.Client(http2=True, proxies=...)` can negotiate HTTP/2 on connections tunneled through a proxy. Older `httpcore` versions that don't accept these arguments on `HTTPProxy` remain supported.
+
 ## 0.21.1 (16th November, 2021)
 
 ### Fixed

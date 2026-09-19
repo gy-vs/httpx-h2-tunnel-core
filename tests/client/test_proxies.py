@@ -270,3 +270,169 @@ def test_for_deprecated_proxy_params(proxies, is_valid):
             httpx.Client(proxies=proxies)
     else:
         httpx.Client(proxies=proxies)
+
+
+def http_proxy_stand_in(supports_http1_http2, type_error=None):
+    """
+    Create a stand-in for `httpcore.HTTPProxy`, mirroring either the
+    signature of httpcore 0.14.4+ (accepting `http1`/`http2`), or the
+    signature of earlier httpcore releases (without `http1`/`http2`).
+
+    Optionally raises `TypeError` from within the constructor itself.
+    """
+
+    class NewSignatureHTTPProxy:
+        attempts = []
+
+        def __init__(
+            self,
+            proxy_url,
+            proxy_headers=None,
+            ssl_context=None,
+            max_connections=None,
+            max_keepalive_connections=None,
+            keepalive_expiry=None,
+            http1=None,
+            http2=None,
+        ):
+            self.attempts.append(
+                {
+                    "proxy_url": proxy_url,
+                    "proxy_headers": proxy_headers,
+                    "http1": http1,
+                    "http2": http2,
+                }
+            )
+            if type_error is not None:
+                raise TypeError(type_error)
+
+    class OldSignatureHTTPProxy:
+        attempts = []
+
+        def __init__(
+            self,
+            proxy_url,
+            proxy_headers=None,
+            ssl_context=None,
+            max_connections=None,
+            max_keepalive_connections=None,
+            keepalive_expiry=None,
+        ):
+            self.attempts.append(
+                {"proxy_url": proxy_url, "proxy_headers": proxy_headers}
+            )
+            if type_error is not None:
+                raise TypeError(type_error)
+
+    if supports_http1_http2:
+        return NewSignatureHTTPProxy
+    return OldSignatureHTTPProxy
+
+
+@pytest.mark.parametrize(["http1", "http2"], [(True, False), (True, True)])
+def test_proxy_transport_forwards_http1_http2(monkeypatch, http1, http2):
+    """
+    The `http1`/`http2` arguments should be passed through to
+    `httpcore.HTTPProxy`, so that tunneled connections can negotiate
+    the same protocol versions as direct connections.
+    """
+    stand_in = http_proxy_stand_in(supports_http1_http2=True)
+    monkeypatch.setattr(httpcore, "HTTPProxy", stand_in)
+
+    httpx.HTTPTransport(
+        proxy=httpx.Proxy("http://username:password@127.0.0.1:8080"),
+        http1=http1,
+        http2=http2,
+    )
+
+    (attempt,) = stand_in.attempts
+    assert attempt["proxy_url"] == url_to_origin("http://127.0.0.1:8080")
+    assert attempt["http1"] is http1
+    assert attempt["http2"] is http2
+    assert (
+        b"Proxy-Authorization",
+        b"Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+    ) in attempt["proxy_headers"]
+
+
+@pytest.mark.parametrize(["http1", "http2"], [(True, False), (True, True)])
+def test_proxy_transport_http1_http2_fallback(monkeypatch, http1, http2):
+    """
+    Versions of httpcore prior to 0.14.4 don't accept `http1`/`http2`
+    on `HTTPProxy`. Against those, the transport should fall back to
+    constructing the proxy pool without them.
+    """
+    stand_in = http_proxy_stand_in(supports_http1_http2=False)
+    monkeypatch.setattr(httpcore, "HTTPProxy", stand_in)
+
+    transport = httpx.HTTPTransport(
+        proxy=httpx.Proxy("http://username:password@127.0.0.1:8080"),
+        http1=http1,
+        http2=http2,
+    )
+
+    assert isinstance(transport._pool, stand_in)
+    (attempt,) = stand_in.attempts
+    assert attempt["proxy_url"] == url_to_origin("http://127.0.0.1:8080")
+    assert "http1" not in attempt
+    assert "http2" not in attempt
+    assert (
+        b"Proxy-Authorization",
+        b"Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+    ) in attempt["proxy_headers"]
+
+
+def test_proxy_transport_does_not_suppress_constructor_type_error(monkeypatch):
+    """
+    A `TypeError` raised from within the `httpcore.HTTPProxy` constructor
+    itself should not be mistaken for an outdated httpcore signature,
+    and should not trigger the fallback.
+    """
+    stand_in = http_proxy_stand_in(
+        supports_http1_http2=True, type_error="a genuine TypeError"
+    )
+    monkeypatch.setattr(httpcore, "HTTPProxy", stand_in)
+
+    with pytest.raises(TypeError, match="a genuine TypeError"):
+        httpx.HTTPTransport(proxy=httpx.Proxy("http://127.0.0.1:8080"), http2=True)
+
+    # The constructor was only called once, with no fallback retry.
+    assert len(stand_in.attempts) == 1
+
+
+def test_proxy_transport_fallback_does_not_suppress_constructor_type_error(
+    monkeypatch,
+):
+    """
+    When the fallback is used against an outdated httpcore signature,
+    a `TypeError` raised from within the retried constructor should
+    still propagate.
+    """
+    stand_in = http_proxy_stand_in(
+        supports_http1_http2=False, type_error="a genuine TypeError"
+    )
+    monkeypatch.setattr(httpcore, "HTTPProxy", stand_in)
+
+    with pytest.raises(TypeError, match="a genuine TypeError"):
+        httpx.HTTPTransport(proxy=httpx.Proxy("http://127.0.0.1:8080"), http2=True)
+
+
+def test_client_proxy_transport_http2(monkeypatch):
+    """
+    A client with `http2=True` should pass the protocol flags through
+    to the proxy transport, so that HTTP/2 can be negotiated on
+    connections tunneled through the proxy.
+    """
+    stand_in = http_proxy_stand_in(supports_http1_http2=True)
+    monkeypatch.setattr(httpcore, "HTTPProxy", stand_in)
+
+    client = httpx.Client(http2=True, proxies="http://username:password@127.0.0.1:8080")
+
+    assert isinstance(client._mounts[URLPattern("all://")], httpx.HTTPTransport)
+    (attempt,) = stand_in.attempts
+    assert attempt["http1"] is True
+    assert attempt["http2"] is True
+    assert (
+        b"Proxy-Authorization",
+        b"Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+    ) in attempt["proxy_headers"]

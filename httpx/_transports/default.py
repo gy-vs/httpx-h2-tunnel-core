@@ -24,6 +24,7 @@ transport = httpx.HTTPTransport(uds="socket.uds")
 client = httpx.Client(transport=transport)
 """
 import contextlib
+import inspect
 import typing
 from types import TracebackType
 
@@ -138,7 +139,7 @@ class HTTPTransport(BaseTransport):
                 retries=retries,
             )
         else:
-            self._pool = httpcore.HTTPProxy(
+            proxy_kwargs: typing.Dict[str, typing.Any] = dict(
                 proxy_url=httpcore.URL(
                     scheme=proxy.url.raw_scheme,
                     host=proxy.url.raw_host,
@@ -151,6 +152,21 @@ class HTTPTransport(BaseTransport):
                 max_keepalive_connections=limits.max_keepalive_connections,
                 keepalive_expiry=limits.keepalive_expiry,
             )
+            try:
+                # The `http1`/`http2` arguments were added to
+                # `httpcore.HTTPProxy` in httpcore 0.14.4.
+                self._pool = httpcore.HTTPProxy(
+                    http1=http1, http2=http2, **proxy_kwargs
+                )
+            except TypeError:
+                # Older versions of httpcore don't accept the `http1`/`http2`
+                # arguments on `HTTPProxy`. Only fall back to the previous
+                # behaviour if that's genuinely the case, so that we don't
+                # suppress a `TypeError` raised from within the constructor.
+                parameters = inspect.signature(httpcore.HTTPProxy.__init__).parameters
+                if "http1" in parameters and "http2" in parameters:
+                    raise
+                self._pool = httpcore.HTTPProxy(**proxy_kwargs)
 
     def __enter__(self: T) -> T:  # Use generics for subclass support.
         self._pool.__enter__()
